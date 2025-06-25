@@ -18,6 +18,11 @@
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::ptr_as_ptr)]
 
+#[cfg(all(feature = "jit", target_os = "zkvm"))]
+compile_error!("'jit' feature not supported on zkvm target.");
+#[cfg(all(feature = "debugger", target_os = "zkvm"))]
+compile_error!("'debugger' feature not supported on zkvm target.");
+
 extern crate byteorder;
 extern crate combine;
 extern crate hash32;
