@@ -6,5 +6,4 @@ edition = "2018"
 publish = false
 
 [dependencies]
-libc = "0.2"
-solana_rbpf = { path = "../" }
+solana_rbpf = { path = "../", default-features = false }

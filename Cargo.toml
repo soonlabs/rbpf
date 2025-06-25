@@ -26,15 +26,15 @@ gdbstub = { version = "0.6.2", optional = true }
 goblin = "0.5.1"
 hash32 = "0.2.0"
 log = "0.4.2"
-rand = { version = "0.8.5", features = ["small_rng"]}
+rand = { version = "0.8.5", features = ["small_rng"] }
 rustc-demangle = "0.1"
-scroll = "0.11"
 thiserror = "1.0.26"
+num-traits = "0.2.19"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(all(windows, not(target_os = "zkvm")))'.dependencies]
 winapi = { version = "0.3", features = ["memoryapi", "sysinfoapi", "winnt", "errhandlingapi"], optional = true }
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(all(not(windows), not(target_os = "zkvm")))'.dependencies]
 libc = { version = "0.2", optional = true }
 
 [features]

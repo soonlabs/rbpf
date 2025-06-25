@@ -31,6 +31,7 @@ use crate::{
 use crate::jit::{JitCompiler, JitProgram};
 use byteorder::{ByteOrder, LittleEndian};
 use std::{collections::BTreeMap, fmt::Debug, mem, ops::Range, str, sync::Arc};
+use num_traits::ToPrimitive;
 
 /// Error definitions
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -630,11 +631,11 @@ impl<C: ContextObject> Executable<C> {
         elf_bytes: &[u8],
     ) -> Result<Section, ElfError> {
         // the lowest section address
-        let mut lowest_addr = usize::MAX;
+        let mut lowest_addr = u64::MAX;
         // the highest section address
         let mut highest_addr = 0;
         // the aggregated section length, not including gaps between sections
-        let mut ro_fill_length = 0usize;
+        let mut ro_fill_length = 0u64;
         let mut invalid_offsets = false;
         // when sbpf_version.enable_elf_vaddr()=true, we allow section_addr != sh_offset
         // if section_addr - sh_offset is constant across all sections. That is,
@@ -714,10 +715,9 @@ impl<C: ContextObject> Executable<C> {
                 .get(section_header.file_range().unwrap_or_default())
                 .ok_or(ElfError::ValueOutOfBounds)?;
 
-            let section_addr = section_addr as usize;
             lowest_addr = lowest_addr.min(section_addr);
-            highest_addr = highest_addr.max(section_addr.saturating_add(section_data.len()));
-            ro_fill_length = ro_fill_length.saturating_add(section_data.len());
+            highest_addr = highest_addr.max(section_addr.saturating_add(section_data.len() as u64));
+            ro_fill_length = ro_fill_length.saturating_add(section_data.len() as u64);
 
             ro_slices.push((section_addr, section_data));
         }
@@ -742,22 +742,23 @@ impl<C: ContextObject> Executable<C> {
             // corresponding buffer offsets can be translated by a constant
             // amount. Subtract the constant to get buffer positions.
             let buf_offset_start =
-                lowest_addr.saturating_sub(addr_file_offset.unwrap_or(0) as usize);
+                lowest_addr.saturating_sub(addr_file_offset.unwrap_or(0)).to_usize().ok_or(ElfError::ValueOutOfBounds)?;
             let buf_offset_end =
-                highest_addr.saturating_sub(addr_file_offset.unwrap_or(0) as usize);
+                highest_addr.saturating_sub(addr_file_offset.unwrap_or(0)).to_usize().ok_or(ElfError::ValueOutOfBounds)?;
 
-            let addr_offset = if lowest_addr >= ebpf::MM_PROGRAM_START as usize {
+            let addr_offset = if lowest_addr >= ebpf::MM_PROGRAM_START {
                 // The first field of Section::Borrowed is an offset from
                 // ebpf::MM_PROGRAM_START so if the linker has already put the
                 // sections within ebpf::MM_PROGRAM_START, we need to subtract
                 // it now.
-                lowest_addr.saturating_sub(ebpf::MM_PROGRAM_START as usize)
+                lowest_addr.saturating_sub(ebpf::MM_PROGRAM_START)
             } else {
                 if sbpf_version.enable_elf_vaddr() {
                     return Err(ElfError::ValueOutOfBounds);
                 }
                 lowest_addr
             };
+            let addr_offset = addr_offset.to_usize().ok_or(ElfError::ValueOutOfBounds)?;
 
             Section::Borrowed(addr_offset, buf_offset_start..buf_offset_end)
         } else {
@@ -777,23 +778,24 @@ impl<C: ContextObject> Executable<C> {
                 lowest_addr = 0;
             };
 
-            let buf_len = highest_addr;
+            let buf_len = highest_addr.to_usize().ok_or(ElfError::ValueOutOfBounds)?;
             if buf_len > elf_bytes.len() {
                 return Err(ElfError::ValueOutOfBounds);
             }
 
             let mut ro_section = vec![0; buf_len];
             for (section_addr, slice) in ro_slices.iter() {
-                let buf_offset_start = section_addr.saturating_sub(lowest_addr);
+                let buf_offset_start = section_addr.saturating_sub(lowest_addr).to_usize().ok_or(ElfError::ValueOutOfBounds)?;
                 ro_section[buf_offset_start..buf_offset_start.saturating_add(slice.len())]
                     .copy_from_slice(slice);
             }
 
-            let addr_offset = if lowest_addr >= ebpf::MM_PROGRAM_START as usize {
-                lowest_addr.saturating_sub(ebpf::MM_PROGRAM_START as usize)
+            let addr_offset = if lowest_addr >= ebpf::MM_PROGRAM_START {
+                lowest_addr.saturating_sub(ebpf::MM_PROGRAM_START)
             } else {
                 lowest_addr
             };
+            let addr_offset = addr_offset.to_usize().ok_or(ElfError::ValueOutOfBounds)?;
             Section::Owned(addr_offset, ro_section)
         };
 
@@ -859,25 +861,26 @@ impl<C: ContextObject> Executable<C> {
 
         // Fixup all the relocations in the relocation section if exists
         for relocation in elf.dynamic_relocations() {
-            let mut r_offset = relocation.r_offset() as usize;
+            let mut r_offset = relocation.r_offset() as u64;
 
             // When sbpf_version.enable_elf_vaddr()=true, we allow section.sh_addr !=
             // section.sh_offset so we need to bring r_offset to the correct
             // byte offset.
             if sbpf_version.enable_elf_vaddr() {
                 match program_header {
-                    Some(header) if header.vm_range().contains(&(r_offset as u64)) => {}
+                    Some(header) if header.vm_range().contains(&r_offset) => {}
                     _ => {
                         program_header = elf
                             .program_headers()
-                            .find(|header| header.vm_range().contains(&(r_offset as u64)))
+                            .find(|header| header.vm_range().contains(&r_offset))
                     }
                 }
                 let header = program_header.as_ref().ok_or(ElfError::ValueOutOfBounds)?;
                 r_offset = r_offset
-                    .saturating_sub(header.p_vaddr() as usize)
-                    .saturating_add(header.p_offset() as usize);
+                    .saturating_sub(header.p_vaddr() as u64)
+                    .saturating_add(header.p_offset() as u64);
             }
+            let r_offset = r_offset.to_usize().ok_or(ElfError::ValueOutOfBounds)?;
 
             match BpfRelocationType::from_x86_relocation_type(relocation.r_type()) {
                 Some(BpfRelocationType::R_Bpf_64_64) => {
