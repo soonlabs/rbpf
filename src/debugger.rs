@@ -159,7 +159,7 @@ fn get_host_ptr<C: ContextObject>(
     match interpreter.vm.memory_mapping.map(
         AccessType::Load,
         vm_addr,
-        std::mem::size_of::<u8>() as u64,
+        std::mem::size_of::<u8>(),
     ) {
         ProgramResult::Ok(host_addr) => Ok(host_addr as *mut u8),
         ProgramResult::Err(err) => Err(err),

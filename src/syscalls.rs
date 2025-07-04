@@ -28,6 +28,7 @@ use crate::{
     vm::TestContextObject,
 };
 use std::{slice::from_raw_parts, str::from_utf8};
+use num_traits::ToPrimitive;
 
 declare_builtin_function!(
     /// Prints its **last three** arguments to standard output. The **first two** arguments are
@@ -93,9 +94,9 @@ declare_builtin_function!(
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Box<dyn std::error::Error>> {
         let host_addr: Result<u64, EbpfError> =
-            memory_mapping.map(AccessType::Store, vm_addr, len).into();
-        let host_addr = host_addr?;
-        for i in 0..len {
+            memory_mapping.map(AccessType::Store, vm_addr, len as usize).into();
+        let host_addr = host_addr?.to_usize().ok_or(EbpfError::CastU64ToUsizeFailed)?;
+        for i in 0..len as usize {
             unsafe {
                 let p = (host_addr + i) as *mut u8;
                 *p ^= 0b101010;
@@ -156,7 +157,7 @@ declare_builtin_function!(
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Box<dyn std::error::Error>> {
         let host_addr: Result<u64, EbpfError> =
-            memory_mapping.map(AccessType::Load, vm_addr, len).into();
+            memory_mapping.map(AccessType::Load, vm_addr, len as usize).into();
         let host_addr = host_addr?;
         unsafe {
             let c_buf = from_raw_parts(host_addr as *const u8, len as usize);

@@ -14,7 +14,7 @@ use std::{
     ops::Range,
     ptr::{self, copy_nonoverlapping},
 };
-
+use num_traits::ToPrimitive;
 /* Explaination of the Gapped Memory
 
     The MemoryMapping supports a special mapping mode which is used for the stack MemoryRegion.
@@ -46,20 +46,20 @@ pub enum MemoryState {
 }
 
 /// Callback executed when a CoW memory region is written to
-pub type MemoryCowCallback = Box<dyn Fn(u64) -> Result<u64, ()>>;
+pub type MemoryCowCallback = Box<dyn Fn(u64) -> Result<usize, ()>>;
 
 /// Memory region for bounds checking and address translation
 #[derive(Default, Eq, PartialEq)]
 #[repr(C, align(32))]
 pub struct MemoryRegion {
     /// start host address
-    pub host_addr: Cell<u64>,
+    pub host_addr: Cell<usize>,
     /// start virtual address
     pub vm_addr: u64,
     /// end virtual address
     pub vm_addr_end: u64,
     /// Length in bytes
-    pub len: u64,
+    pub len: usize,
     /// Size of regular gaps as bit shift (63 means this region is continuous)
     pub vm_gap_shift: u8,
     /// Whether the region is readonly, writable or must be copied before writing
@@ -78,10 +78,10 @@ impl MemoryRegion {
             debug_assert_eq!(Some(vm_gap_size), 1_u64.checked_shl(vm_gap_shift as u32));
         };
         MemoryRegion {
-            host_addr: Cell::new(slice.as_ptr() as u64),
+            host_addr: Cell::new(slice.as_ptr() as usize),
             vm_addr,
             vm_addr_end,
-            len: slice.len() as u64,
+            len: slice.len(),
             vm_gap_shift,
             state: Cell::new(state),
         }
@@ -120,7 +120,7 @@ impl MemoryRegion {
     }
 
     /// Convert a virtual machine address into a host address
-    pub fn vm_to_host(&self, vm_addr: u64, len: u64) -> ProgramResult {
+    pub fn vm_to_host(&self, vm_addr: u64, len: usize) -> ProgramResult {
         // This can happen if a region starts at an offset from the base region
         // address, eg with rodata regions if config.optimize_rodata = true, see
         // Elf::get_ro_region.
@@ -128,18 +128,20 @@ impl MemoryRegion {
             return ProgramResult::Err(EbpfError::InvalidVirtualAddress(vm_addr));
         }
 
-        let begin_offset = vm_addr.saturating_sub(self.vm_addr);
+        let Some(begin_offset) = vm_addr.saturating_sub(self.vm_addr).to_usize() else {
+            return ProgramResult::Err(EbpfError::CastU64ToUsizeFailed)
+        };
         let is_in_gap = (begin_offset
             .checked_shr(self.vm_gap_shift as u32)
             .unwrap_or(0)
             & 1)
             == 1;
-        let gap_mask = (-1i64).checked_shl(self.vm_gap_shift as u32).unwrap_or(0) as u64;
+        let gap_mask = (-1isize).checked_shl(self.vm_gap_shift as u32).unwrap_or(0) as usize;
         let gapped_offset =
             (begin_offset & gap_mask).checked_shr(1).unwrap_or(0) | (begin_offset & !gap_mask);
         if let Some(end_offset) = gapped_offset.checked_add(len) {
             if end_offset <= self.len && !is_in_gap {
-                return ProgramResult::Ok(self.host_addr.get().saturating_add(gapped_offset));
+                return ProgramResult::Ok(self.host_addr.get().saturating_add(gapped_offset) as u64);
             }
         }
         ProgramResult::Err(EbpfError::InvalidVirtualAddress(vm_addr))
@@ -320,7 +322,7 @@ impl<'a> UnalignedMemoryMapping<'a> {
     }
 
     /// Given a list of regions translate from virtual machine to host address
-    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: u64) -> ProgramResult {
+    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: usize) -> ProgramResult {
         // Safety:
         // &mut references to the mapping cache are only created internally from methods that do not
         // invoke each other. UnalignedMemoryMapping is !Sync, so the cache reference below is
@@ -354,8 +356,8 @@ impl<'a> UnalignedMemoryMapping<'a> {
     /// See [MemoryMapping::load].
     #[inline(always)]
     pub fn load<T: Pod + Into<u64>>(&self, mut vm_addr: u64) -> ProgramResult {
-        let mut len = mem::size_of::<T>() as u64;
-        debug_assert!(len <= mem::size_of::<u64>() as u64);
+        let mut len = mem::size_of::<T>();
+        debug_assert!(len <= mem::size_of::<usize>());
 
         // Safety:
         // &mut references to the mapping cache are only created internally from methods that do not
@@ -392,7 +394,10 @@ impl<'a> UnalignedMemoryMapping<'a> {
         let mut ptr = std::ptr::addr_of_mut!(value).cast::<u8>();
 
         while len > 0 {
-            let load_len = len.min(region.vm_addr_end.saturating_sub(vm_addr));
+            let Some(offset) = region.vm_addr_end.saturating_sub(vm_addr).to_usize() else {
+                return ProgramResult::Err(EbpfError::CastU64ToUsizeFailed);
+            };
+            let load_len = len.min(offset);
             if load_len == 0 {
                 break;
             }
@@ -401,14 +406,14 @@ impl<'a> UnalignedMemoryMapping<'a> {
                 // we debug_assert!(len <= mem::size_of::<u64>()) so we never
                 // overflow &value
                 unsafe {
-                    copy_nonoverlapping(host_addr as *const _, ptr, load_len as usize);
-                    ptr = ptr.add(load_len as usize);
+                    copy_nonoverlapping(host_addr as *const _, ptr, load_len);
+                    ptr = ptr.add(load_len);
                 };
                 len = len.saturating_sub(load_len);
                 if len == 0 {
                     return ProgramResult::Ok(value);
                 }
-                vm_addr = vm_addr.saturating_add(load_len);
+                vm_addr = vm_addr.saturating_add(load_len as u64);
                 region = match self.find_region(cache, vm_addr) {
                     Some(region) => region,
                     None => break,
@@ -432,7 +437,7 @@ impl<'a> UnalignedMemoryMapping<'a> {
     /// See [MemoryMapping::store].
     #[inline]
     pub fn store<T: Pod>(&self, value: T, mut vm_addr: u64) -> ProgramResult {
-        let mut len = mem::size_of::<T>() as u64;
+        let mut len = mem::size_of::<T>();
 
         // Safety:
         // &mut references to the mapping cache are only created internally from methods that do not
@@ -474,20 +479,23 @@ impl<'a> UnalignedMemoryMapping<'a> {
                 break;
             }
 
-            let write_len = len.min(region.vm_addr_end.saturating_sub(vm_addr));
+            let Some(offset) = region.vm_addr_end.saturating_sub(vm_addr).to_usize() else {
+                return ProgramResult::Err(EbpfError::CastU64ToUsizeFailed);
+            };
+            let write_len = len.min(offset);
             if write_len == 0 {
                 break;
             }
             if let ProgramResult::Ok(host_addr) = region.vm_to_host(vm_addr, write_len) {
                 // Safety:
                 // vm_to_host() succeeded so we have enough space for write_len
-                unsafe { copy_nonoverlapping(src, host_addr as *mut _, write_len as usize) };
+                unsafe { copy_nonoverlapping(src, host_addr as *mut _, write_len) };
                 len = len.saturating_sub(write_len);
                 if len == 0 {
                     return ProgramResult::Ok(host_addr);
                 }
-                src = unsafe { src.add(write_len as usize) };
-                vm_addr = vm_addr.saturating_add(write_len);
+                src = unsafe { src.add(write_len) };
+                vm_addr = vm_addr.saturating_add(write_len as u64);
                 region = match self.find_region(cache, vm_addr) {
                     Some(region) => region,
                     None => break,
@@ -625,10 +633,14 @@ impl<'a> AlignedMemoryMapping<'a> {
     }
 
     /// Given a list of regions translate from virtual machine to host address
-    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: u64) -> ProgramResult {
-        let index = vm_addr
+    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: usize) -> ProgramResult {
+        let Some(index) = vm_addr
             .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
-            .unwrap_or(0) as usize;
+            .unwrap_or(0)
+            .to_usize()
+        else {
+            return ProgramResult::Err(EbpfError::CastU64ToUsizeFailed);
+        };
         if (1..self.regions.len()).contains(&index) {
             let region = &self.regions[index];
             if access_type == AccessType::Load || ensure_writable_region(region, &self.cow_cb) {
@@ -645,7 +657,7 @@ impl<'a> AlignedMemoryMapping<'a> {
     /// See [MemoryMapping::load].
     #[inline]
     pub fn load<T: Pod + Into<u64>>(&self, vm_addr: u64) -> ProgramResult {
-        let len = mem::size_of::<T>() as u64;
+        let len = mem::size_of::<T>();
         match self.map(AccessType::Load, vm_addr, len) {
             ProgramResult::Ok(host_addr) => {
                 ProgramResult::Ok(unsafe { ptr::read_unaligned::<T>(host_addr as *const _) }.into())
@@ -659,8 +671,8 @@ impl<'a> AlignedMemoryMapping<'a> {
     /// See [MemoryMapping::store].
     #[inline]
     pub fn store<T: Pod>(&self, value: T, vm_addr: u64) -> ProgramResult {
-        let len = mem::size_of::<T>() as u64;
-        debug_assert!(len <= mem::size_of::<u64>() as u64);
+        let len = mem::size_of::<T>();
+        debug_assert!(len <= mem::size_of::<usize>());
 
         match self.map(AccessType::Store, vm_addr, len) {
             ProgramResult::Ok(host_addr) => {
@@ -682,9 +694,13 @@ impl<'a> AlignedMemoryMapping<'a> {
         access_type: AccessType,
         vm_addr: u64,
     ) -> Result<&MemoryRegion, EbpfError> {
-        let index = vm_addr
+        let Some(index) = vm_addr
             .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
-            .unwrap_or(0) as usize;
+            .unwrap_or(0)
+            .to_usize()
+        else {
+            return Err(EbpfError::CastU64ToUsizeFailed);
+        };
         if (1..self.regions.len()).contains(&index) {
             let region = &self.regions[index];
             if (region.vm_addr..region.vm_addr_end).contains(&vm_addr)
@@ -712,12 +728,16 @@ impl<'a> AlignedMemoryMapping<'a> {
         let begin_index = region
             .vm_addr
             .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
-            .unwrap_or(0) as usize;
+            .unwrap_or(0)
+            .to_usize()
+            .ok_or(EbpfError::CastU64ToUsizeFailed)?;
         let end_index = region
             .vm_addr
-            .saturating_add(region.len.saturating_sub(1))
+            .saturating_add(region.len.saturating_sub(1) as u64)
             .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
-            .unwrap_or(0) as usize;
+            .unwrap_or(0)
+            .to_usize()
+            .ok_or(EbpfError::CastU64ToUsizeFailed)?;
         if begin_index != index || end_index != index {
             return Err(EbpfError::InvalidMemoryRegion(index));
         }
@@ -779,7 +799,7 @@ impl<'a> MemoryMapping<'a> {
     }
 
     /// Map virtual memory to host memory.
-    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: u64) -> ProgramResult {
+    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: usize) -> ProgramResult {
         match self {
             MemoryMapping::Identity => ProgramResult::Ok(vm_addr),
             MemoryMapping::Aligned(m) => m.map(access_type, vm_addr, len),
@@ -872,7 +892,7 @@ fn generate_access_violation(
     sbpf_version: &SBPFVersion,
     access_type: AccessType,
     vm_addr: u64,
-    len: u64,
+    len: usize,
 ) -> ProgramResult {
     let stack_frame = (vm_addr as i64)
         .saturating_sub(ebpf::MM_STACK_START as i64)
@@ -1203,14 +1223,14 @@ mod test {
                 .unwrap()
                 .host_addr
                 .get(),
-            mem1.as_ptr() as u64
+            mem1.as_ptr() as usize
         );
         assert_eq!(
             m.region(AccessType::Load, ebpf::MM_INPUT_START + 3)
                 .unwrap()
                 .host_addr
                 .get(),
-            mem1.as_ptr() as u64
+            mem1.as_ptr() as usize
         );
         assert_error!(
             m.region(AccessType::Store, ebpf::MM_INPUT_START + 4),
@@ -1221,14 +1241,14 @@ mod test {
                 .unwrap()
                 .host_addr
                 .get(),
-            mem2.as_ptr() as u64
+            mem2.as_ptr() as usize
         );
         assert_eq!(
             m.region(AccessType::Load, ebpf::MM_INPUT_START + 7)
                 .unwrap()
                 .host_addr
                 .get(),
-            mem2.as_ptr() as u64
+            mem2.as_ptr() as usize
         );
         assert_error!(
             m.region(AccessType::Load, ebpf::MM_INPUT_START + 8),
@@ -1263,14 +1283,14 @@ mod test {
                 .unwrap()
                 .host_addr
                 .get(),
-            mem1.as_ptr() as u64
+            mem1.as_ptr() as usize
         );
         assert_eq!(
             m.region(AccessType::Load, ebpf::MM_PROGRAM_START + 3)
                 .unwrap()
                 .host_addr
                 .get(),
-            mem1.as_ptr() as u64
+            mem1.as_ptr() as usize
         );
         assert_error!(
             m.region(AccessType::Load, ebpf::MM_PROGRAM_START + 4),
@@ -1286,14 +1306,14 @@ mod test {
                 .unwrap()
                 .host_addr
                 .get(),
-            mem2.as_ptr() as u64
+            mem2.as_ptr() as usize
         );
         assert_eq!(
             m.region(AccessType::Load, ebpf::MM_STACK_START + 3)
                 .unwrap()
                 .host_addr
                 .get(),
-            mem2.as_ptr() as u64
+            mem2.as_ptr() as usize
         );
         assert_error!(
             m.region(AccessType::Load, ebpf::MM_INPUT_START + 4),
@@ -1685,7 +1705,7 @@ mod test {
                 vec![MemoryRegion::new_cow(&original, ebpf::MM_PROGRAM_START, 42)],
                 Box::new(move |_| {
                     c.borrow_mut().extend_from_slice(&original);
-                    Ok(c.borrow().as_slice().as_ptr() as u64)
+                    Ok(c.borrow().as_slice().as_ptr() as usize)
                 }),
                 &config,
                 &SBPFVersion::V2,
@@ -1718,7 +1738,7 @@ mod test {
                 vec![MemoryRegion::new_cow(&original, ebpf::MM_PROGRAM_START, 42)],
                 Box::new(move |_| {
                     c.borrow_mut().extend_from_slice(&original);
-                    Ok(c.borrow().as_slice().as_ptr() as u64)
+                    Ok(c.borrow().as_slice().as_ptr() as usize)
                 }),
                 &config,
                 &SBPFVersion::V2,
@@ -1763,7 +1783,7 @@ mod test {
                     // callback
                     assert_eq!(id, 42);
                     c.borrow_mut().extend_from_slice(&original1);
-                    Ok(c.borrow().as_slice().as_ptr() as u64)
+                    Ok(c.borrow().as_slice().as_ptr() as usize)
                 }),
                 &config,
                 &SBPFVersion::V2,

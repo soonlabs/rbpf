@@ -53,10 +53,10 @@ pub enum EbpfError {
     InvalidMemoryRegion(usize),
     /// Access violation (general)
     #[error("Access violation in {3} section at address {1:#x} of size {2:?}")]
-    AccessViolation(AccessType, u64, u64, &'static str),
+    AccessViolation(AccessType, u64, usize, &'static str),
     /// Access violation (stack specific)
     #[error("Access violation in stack frame {3} at address {1:#x} of size {2:?}")]
-    StackAccessViolation(AccessType, u64, u64, i64),
+    StackAccessViolation(AccessType, u64, usize, i64),
     /// Invalid instruction
     #[error("invalid BPF instruction")]
     InvalidInstruction,
@@ -75,6 +75,9 @@ pub enum EbpfError {
     /// Syscall error
     #[error("Syscall error: {0}")]
     SyscallError(Box<dyn Error>),
+    /// Failed to cast an u64 to usize
+    #[error("Failed to cast an u64 value to usize")]
+    CastU64ToUsizeFailed,
 }
 
 /// Same as `Result` but provides a stable memory layout

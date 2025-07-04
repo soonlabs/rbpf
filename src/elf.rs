@@ -95,7 +95,7 @@ pub enum ElfError {
     WrongType,
     /// Unknown symbol
     #[error("Unknown symbol with index {0}")]
-    UnknownSymbol(usize),
+    UnknownSymbol(u64),
     /// Offset or value is out of bounds
     #[error("Offset or value is out of bounds")]
     ValueOutOfBounds,
@@ -105,6 +105,9 @@ pub enum ElfError {
     /// Invalid program header
     #[error("Invalid ELF program header")]
     InvalidProgramHeader,
+    /// Failed to cast an u64 to usize
+    #[error("Failed to cast an u64 value to usize")]
+    CastU64ToUsizeFailed,
 }
 
 // For more information on the BPF instruction set:
@@ -248,7 +251,9 @@ impl<C: ContextObject> Executable<C> {
             .text_section_info
             .vaddr
             .saturating_sub(ebpf::MM_PROGRAM_START)
-            .saturating_sub(ro_offset as u64) as usize;
+            .saturating_sub(ro_offset as u64)
+            .to_usize()
+            .expect("cast u64 to usize failed");
         (
             self.text_section_info.vaddr,
             &ro_section[offset..offset.saturating_add(self.text_section_info.offset_range.len())],
@@ -440,11 +445,11 @@ impl<C: ContextObject> Executable<C> {
         )?;
 
         // calculate entrypoint offset into the text section
-        let offset = header.e_entry.saturating_sub(text_section.sh_addr());
-        if offset.checked_rem(ebpf::INSN_SIZE as u64) != Some(0) {
+        let offset = header.e_entry.saturating_sub(text_section.sh_addr()).to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
+        if offset.checked_rem(INSN_SIZE) != Some(0) {
             return Err(ElfError::InvalidEntrypoint);
         }
-        let entry_pc = if let Some(entry_pc) = (offset as usize).checked_div(ebpf::INSN_SIZE) {
+        let entry_pc = if let Some(entry_pc) = offset.checked_div(INSN_SIZE) {
             if !sbpf_version.static_syscalls() {
                 function_registry.unregister_function(ebpf::hash_symbol_name(b"entrypoint"));
             }
@@ -603,11 +608,13 @@ impl<C: ContextObject> Executable<C> {
         }
 
         for section_header in elf.section_headers() {
-            let start = section_header.sh_offset() as usize;
+            let start = section_header.sh_offset().to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
             let end = section_header
                 .sh_offset()
                 .checked_add(section_header.sh_size())
-                .ok_or(ElfError::ValueOutOfBounds)? as usize;
+                .ok_or(ElfError::ValueOutOfBounds)?
+                .to_usize()
+                .ok_or(ElfError::CastU64ToUsizeFailed)?;
             let _ = elf_bytes
                 .get(start..end)
                 .ok_or(ElfError::ValueOutOfBounds)?;
@@ -742,9 +749,9 @@ impl<C: ContextObject> Executable<C> {
             // corresponding buffer offsets can be translated by a constant
             // amount. Subtract the constant to get buffer positions.
             let buf_offset_start =
-                lowest_addr.saturating_sub(addr_file_offset.unwrap_or(0)).to_usize().ok_or(ElfError::ValueOutOfBounds)?;
+                lowest_addr.saturating_sub(addr_file_offset.unwrap_or(0)).to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
             let buf_offset_end =
-                highest_addr.saturating_sub(addr_file_offset.unwrap_or(0)).to_usize().ok_or(ElfError::ValueOutOfBounds)?;
+                highest_addr.saturating_sub(addr_file_offset.unwrap_or(0)).to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
 
             let addr_offset = if lowest_addr >= ebpf::MM_PROGRAM_START {
                 // The first field of Section::Borrowed is an offset from
@@ -758,7 +765,7 @@ impl<C: ContextObject> Executable<C> {
                 }
                 lowest_addr
             };
-            let addr_offset = addr_offset.to_usize().ok_or(ElfError::ValueOutOfBounds)?;
+            let addr_offset = addr_offset.to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
 
             Section::Borrowed(addr_offset, buf_offset_start..buf_offset_end)
         } else {
@@ -778,14 +785,14 @@ impl<C: ContextObject> Executable<C> {
                 lowest_addr = 0;
             };
 
-            let buf_len = highest_addr.to_usize().ok_or(ElfError::ValueOutOfBounds)?;
+            let buf_len = highest_addr.to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
             if buf_len > elf_bytes.len() {
                 return Err(ElfError::ValueOutOfBounds);
             }
 
             let mut ro_section = vec![0; buf_len];
             for (section_addr, slice) in ro_slices.iter() {
-                let buf_offset_start = section_addr.saturating_sub(lowest_addr).to_usize().ok_or(ElfError::ValueOutOfBounds)?;
+                let buf_offset_start = section_addr.saturating_sub(lowest_addr).to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
                 ro_section[buf_offset_start..buf_offset_start.saturating_add(slice.len())]
                     .copy_from_slice(slice);
             }
@@ -795,7 +802,7 @@ impl<C: ContextObject> Executable<C> {
             } else {
                 lowest_addr
             };
-            let addr_offset = addr_offset.to_usize().ok_or(ElfError::ValueOutOfBounds)?;
+            let addr_offset = addr_offset.to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
             Section::Owned(addr_offset, ro_section)
         };
 
@@ -880,7 +887,7 @@ impl<C: ContextObject> Executable<C> {
                     .saturating_sub(header.p_vaddr() as u64)
                     .saturating_add(header.p_offset() as u64);
             }
-            let r_offset = r_offset.to_usize().ok_or(ElfError::ValueOutOfBounds)?;
+            let r_offset = r_offset.to_usize().ok_or(ElfError::CastU64ToUsizeFailed)?;
 
             match BpfRelocationType::from_x86_relocation_type(relocation.r_type()) {
                 Some(BpfRelocationType::R_Bpf_64_64) => {
@@ -905,7 +912,7 @@ impl<C: ContextObject> Executable<C> {
 
                     let symbol = elf
                         .dynamic_symbol(relocation.r_sym())
-                        .ok_or_else(|| ElfError::UnknownSymbol(relocation.r_sym() as usize))?;
+                        .ok_or_else(|| ElfError::UnknownSymbol(relocation.r_sym() as u64))?;
 
                     // The relocated address is relative to the address of the
                     // symbol at index `r_sym`
@@ -1071,20 +1078,23 @@ impl<C: ContextObject> Executable<C> {
 
                     let symbol = elf
                         .dynamic_symbol(relocation.r_sym())
-                        .ok_or_else(|| ElfError::UnknownSymbol(relocation.r_sym() as usize))?;
+                        .ok_or_else(|| ElfError::UnknownSymbol(relocation.r_sym() as u64))?;
 
                     let name = elf
                         .dynamic_symbol_name(symbol.st_name() as Elf64Word)
-                        .ok_or_else(|| ElfError::UnknownSymbol(symbol.st_name() as usize))?;
+                        .ok_or_else(|| ElfError::UnknownSymbol(symbol.st_name() as u64))?;
 
                     // If the symbol is defined, this is a bpf-to-bpf call
                     let key = if symbol.is_function() && symbol.st_value() != 0 {
                         if !text_section.vm_range().contains(&symbol.st_value()) {
                             return Err(ElfError::ValueOutOfBounds);
                         }
-                        let target_pc = (symbol.st_value().saturating_sub(text_section.sh_addr())
-                            as usize)
-                            .checked_div(ebpf::INSN_SIZE)
+                        let target_pc = symbol
+                            .st_value()
+                            .saturating_sub(text_section.sh_addr())
+                            .to_usize()
+                            .ok_or(ElfError::CastU64ToUsizeFailed)?
+                            .checked_div(INSN_SIZE)
                             .unwrap_or_default();
                         function_registry.register_function_hashed_legacy(
                             loader,
@@ -1127,12 +1137,16 @@ impl<C: ContextObject> Executable<C> {
                 if !text_section.vm_range().contains(&symbol.st_value()) {
                     return Err(ElfError::ValueOutOfBounds);
                 }
-                let target_pc = (symbol.st_value().saturating_sub(text_section.sh_addr()) as usize)
-                    .checked_div(ebpf::INSN_SIZE)
+                let target_pc = symbol
+                    .st_value()
+                    .saturating_sub(text_section.sh_addr())
+                    .to_usize()
+                    .ok_or(ElfError::CastU64ToUsizeFailed)?
+                    .checked_div(INSN_SIZE)
                     .unwrap_or_default();
                 let name = elf
                     .symbol_name(symbol.st_name() as Elf64Word)
-                    .ok_or_else(|| ElfError::UnknownSymbol(symbol.st_name() as usize))?;
+                    .ok_or_else(|| ElfError::UnknownSymbol(symbol.st_name() as u64))?;
                 function_registry.register_function_hashed_legacy(
                     loader,
                     !sbpf_version.static_syscalls(),
@@ -1620,7 +1634,7 @@ mod test {
 
         // [0..s3.sh_addr + s3.sh_size] is the valid ro memory area
         assert!(matches!(
-            ro_region.vm_to_host(ebpf::MM_PROGRAM_START, s3.sh_addr + s3.sh_size),
+            ro_region.vm_to_host(ebpf::MM_PROGRAM_START, (s3.sh_addr + s3.sh_size) as usize),
             ProgramResult::Ok(ptr) if ptr == owned_section.as_ptr() as u64,
         ));
 
@@ -1664,7 +1678,7 @@ mod test {
         // But for backwards compatibility (config.optimize_rodata=false)
         // [0..s1.sh_addr] is mappable too (and zeroed).
         assert!(matches!(
-            ro_region.vm_to_host(ebpf::MM_PROGRAM_START, s3.sh_addr + s3.sh_size),
+            ro_region.vm_to_host(ebpf::MM_PROGRAM_START, (s3.sh_addr + s3.sh_size) as usize),
             ProgramResult::Ok(ptr) if ptr == owned_section.as_ptr() as u64,
         ));
 
@@ -1720,7 +1734,7 @@ mod test {
         assert!(matches!(
             ro_region.vm_to_host(
                 ebpf::MM_PROGRAM_START + s1.sh_addr,
-                s3.sh_addr + s3.sh_size - s1.sh_addr
+                (s3.sh_addr + s3.sh_size - s1.sh_addr) as usize
             ),
             ProgramResult::Ok(ptr) if ptr == owned_section.as_ptr() as u64,
         ));
@@ -1808,7 +1822,7 @@ mod test {
             // s1 starts at sh_offset=0 so [0..s2.sh_offset + s2.sh_size]
             // is the valid ro memory area
             assert!(matches!(
-                ro_region.vm_to_host(ebpf::MM_PROGRAM_START + s1.sh_offset, s2.sh_offset + s2.sh_size),
+                ro_region.vm_to_host(ebpf::MM_PROGRAM_START + s1.sh_offset, (s2.sh_offset + s2.sh_size) as usize),
                 ProgramResult::Ok(ptr) if ptr == elf_bytes.as_ptr() as u64,
             ));
 
@@ -1862,7 +1876,7 @@ mod test {
             assert!(matches!(
                 ro_region.vm_to_host(
                     ebpf::MM_PROGRAM_START + s2.sh_offset,
-                    s3.sh_offset + s3.sh_size - s2.sh_offset
+                    (s3.sh_offset + s3.sh_size - s2.sh_offset) as usize
                 ),
                 ProgramResult::Ok(ptr) if ptr == elf_bytes[s2.sh_offset as usize..].as_ptr() as u64,
             ));
