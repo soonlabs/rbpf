@@ -9,7 +9,7 @@ fn main() {
     // read the input
     let elf = env::read_frame();
     let executable =
-        Executable::<TestContextObject>::from_elf(&elf, Arc::new(BuiltinProgram::new_mock()))
+        Executable::<TestContextObject>::load(&elf, Arc::new(BuiltinProgram::new_mock()))
             .unwrap();
     executable.verify::<RequisiteVerifier>().unwrap();
     let mut context_object = TestContextObject::default();
